@@ -14,6 +14,9 @@ var (
 		0x3, 0xE, 0xF, 0x8,
 		0x4, 0x7, 0x1, 0x2,
 	}
+	desS = [16]uint8{
+		0xE, 0x4, 0xD, 0x1, 0x2, 0xF, 0xB, 0x8, 0x3, 0xA, 0x6, 0xC, 0x5, 0x9, 0x0, 0x7,
+	}
 
 	P = [16]uint8{
 		0x0, 0x4, 0x8, 0xC,
@@ -27,6 +30,36 @@ var (
 
 	rounds = 4
 )
+
+func makeLAT(sbox [16]uint8) [16][16]int8 {
+	var lat [16][16]int8
+	lat[0][0] = 8
+	for i := 1; i < 16; i++ {
+		for j := 1; j < 16; j++ {
+			counter := 0
+			for k := 0; k < 16; k++ {
+				Y := sbox[k]
+				xParity := parity(uint8(k) & uint8(i))
+				yParity := parity(Y & uint8(j))
+				if xParity^yParity == 0 {
+					counter++
+				}
+			}
+			lat[i][j] = int8(counter) - 8
+		}
+	}
+
+	return lat
+}
+
+func parity(x uint8) uint8 {
+	var p uint8 = 0
+	for x > 0 {
+		p ^= x & 1
+		x >>= 1
+	}
+	return p
+}
 
 func SubBytes(block uint16, sbox [16]uint8) uint16 {
 	return uint16(sbox[(block>>12)&0xF])<<12 |
@@ -50,9 +83,7 @@ func SplitIntoBlocks16(s string) []uint16 {
 	var blocks []uint16
 
 	for i := 0; i < len(data); i += 2 {
-		var block uint16
-		block = uint16(data[i])<<8 | uint16(data[i+1])
-
+		block := uint16(data[i])<<8 | uint16(data[i+1])
 		blocks = append(blocks, block)
 	}
 
@@ -158,28 +189,41 @@ func PKCS7Unpad(data []byte) ([]byte, error) {
 }
 
 func main() {
-	for i, v := range S {
-		InvS[v] = uint8(i)
-	}
-	for i, v := range P {
-		InvP[v] = uint8(i)
-	}
-	plainText := "secret"
-	fmt.Printf("Полученные блоки байт: %v\n", []byte(plainText))
-	blocks := SplitIntoBlocks16(plainText)
+	// for i, v := range S {
+	// 	InvS[v] = uint8(i)
+	// }
+	// for i, v := range P {
+	// 	InvP[v] = uint8(i)
+	// }
+	// plainText := "secret"
+	// fmt.Printf("Полученные блоки байт: %v\n", []byte(plainText))
+	// blocks := SplitIntoBlocks16(plainText)
 
-	keys, err := GenerateKeys16(rounds)
-	if err != nil {
-		fmt.Printf("Ошибка генервции ключа: %v\n", err)
-		return
-	}
+	// keys, err := GenerateKeys16(rounds)
+	// if err != nil {
+	// 	fmt.Printf("Ошибка генервции ключа: %v\n", err)
+	// 	return
+	// }
 
-	encryptedBlocks := EncryptSPN(blocks, keys, rounds)
-	decryptedBlocks := DecryptSPN(encryptedBlocks, keys, rounds)
-	decryptedBytes := JoinIntoBytes(decryptedBlocks)
-	decryptedBytesUnpad, err := PKCS7Unpad(decryptedBytes)
-	if err != nil {
-		fmt.Printf("Ошибка Unpad: %v", err)
+	// copyBlocks := make([]uint16, len(blocks))
+	// copy(copyBlocks, blocks)
+	// encryptedBlocks := EncryptSPN(copyBlocks, keys, rounds)
+
+	// copyEncryptedBlocks := make([]uint16, len(encryptedBlocks))
+	// copy(copyEncryptedBlocks, encryptedBlocks)
+	// decryptedBlocks := DecryptSPN(copyEncryptedBlocks, keys, rounds)
+
+	// decryptedBytes := JoinIntoBytes(decryptedBlocks)
+	// decryptedBytesUnpad, err := PKCS7Unpad(decryptedBytes)
+	// if err != nil {
+	// 	fmt.Printf("Ошибка Unpad: %v", err)
+	// }
+	// fmt.Println(string(decryptedBytesUnpad))
+	lat := makeLAT(desS)
+	for i := 0; i < 16; i++ {
+		for j := 0; j < 16; j++ {
+			fmt.Printf("%4d", lat[i][j])
+		}
+		fmt.Println()
 	}
-	fmt.Println(string(decryptedBytesUnpad))
 }
