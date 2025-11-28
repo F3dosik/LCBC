@@ -1,11 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"fmt"
+	"math"
 	"math/bits"
+	"sort"
 )
+
+/* -----------------------------------------------------
+   S-box / P-box
+----------------------------------------------------- */
 
 var (
 	S = [16]uint8{
@@ -14,9 +19,8 @@ var (
 		0x3, 0xE, 0xF, 0x8,
 		0x4, 0x7, 0x1, 0x2,
 	}
-	desS = [16]uint8{
-		0xE, 0x4, 0xD, 0x1, 0x2, 0xF, 0xB, 0x8, 0x3, 0xA, 0x6, 0xC, 0x5, 0x9, 0x0, 0x7,
-	}
+
+	InvS [16]uint8
 
 	P = [16]uint8{
 		0x0, 0x4, 0x8, 0xC,
@@ -25,201 +29,310 @@ var (
 		0x3, 0x7, 0xB, 0xF,
 	}
 
-	InvS [16]uint8
 	InvP [16]uint8
 
 	rounds = 4
 )
 
-func makeLAT(sbox [16]uint8) [16][16]int8 {
-	var lat [16][16]int8
-	lat[0][0] = 8
-	for i := 1; i < 16; i++ {
-		for j := 1; j < 16; j++ {
-			counter := 0
-			for k := 0; k < 16; k++ {
-				Y := sbox[k]
-				xParity := parity(uint8(k) & uint8(i))
-				yParity := parity(Y & uint8(j))
-				if xParity^yParity == 0 {
-					counter++
+/* -----------------------------------------------------
+   Utility
+----------------------------------------------------- */
+
+func dotParity16(mask uint16, v uint16) uint8 {
+	return uint8(bits.OnesCount16(mask&v) & 1)
+}
+
+func makeLAT(sbox [16]uint8) [16][16]int {
+	var lat [16][16]int
+	for a := 0; a < 16; a++ {
+		for b := 0; b < 16; b++ {
+			cnt := 0
+			for x := 0; x < 16; x++ {
+				l := bits.OnesCount8(uint8(x)&uint8(a)) & 1
+				r := bits.OnesCount8(sbox[x]&uint8(b)) & 1
+				if (l ^ r) == 0 {
+					cnt++
 				}
 			}
-			lat[i][j] = int8(counter) - 8
+			lat[a][b] = cnt - 8
 		}
 	}
-
 	return lat
 }
 
-func parity(x uint8) uint8 {
-	var p uint8 = 0
-	for x > 0 {
-		p ^= x & 1
-		x >>= 1
-	}
-	return p
+/* -----------------------------------------------------
+   SPN Components
+----------------------------------------------------- */
+
+func SubBytes(x uint16, s [16]uint8) uint16 {
+	return (uint16(s[(x>>12)&0xF]) << 12) |
+		(uint16(s[(x>>8)&0xF]) << 8) |
+		(uint16(s[(x>>4)&0xF]) << 4) |
+		uint16(s[x&0xF])
 }
 
-func SubBytes(block uint16, sbox [16]uint8) uint16 {
-	return uint16(sbox[(block>>12)&0xF])<<12 |
-		uint16(sbox[(block>>8)&0xF])<<8 |
-		uint16(sbox[(block>>4)&0xF])<<4 |
-		uint16(sbox[(block&0xF)])
+func InvSubBytes(x uint16, s [16]uint8) uint16 {
+	return (uint16(s[(x>>12)&0xF]) << 12) |
+		(uint16(s[(x>>8)&0xF]) << 8) |
+		(uint16(s[(x>>4)&0xF]) << 4) |
+		uint16(s[x&0xF])
 }
 
-func PermuteBytes(block uint16, pbox [16]uint8) uint16 {
-	var res uint16 = 0
+func PermuteBits(x uint16, p [16]uint8) uint16 {
+	var r uint16 = 0
 	for i := 0; i < 16; i++ {
-		bit := (block >> i) & 1
-		res |= bit << pbox[i]
+		b := (x >> i) & 1
+		r |= b << p[i]
 	}
-	return res
+	return r
 }
 
-func SplitIntoBlocks16(s string) []uint16 {
-	data := PKCS7Pad([]byte(s), 2)
+/* -----------------------------------------------------
+   SPN Encrypt/Decrypt
+----------------------------------------------------- */
 
-	var blocks []uint16
-
-	for i := 0; i < len(data); i += 2 {
-		block := uint16(data[i])<<8 | uint16(data[i+1])
-		blocks = append(blocks, block)
-	}
-
-	return blocks
-}
-
-func GenerateKeys16(rounds int) ([]uint16, error) {
-	var keyBytes [2]byte
-	_, err := rand.Read(keyBytes[:])
-	if err != nil {
-		return nil, err
-	}
-
-	key := uint16(keyBytes[0])<<8 | uint16(keyBytes[1])
-
-	keys := make([]uint16, rounds+1)
-	for i := range rounds + 1 {
-		keys[i] = key
-		key = bits.RotateLeft16(key, 4)
-	}
-
-	return keys, nil
-}
-
-func EncryptSPN(blocks []uint16, keys []uint16, rounds int) []uint16 {
+func EncryptBlock(x uint16, keys []uint16) uint16 {
 	for r := 0; r < rounds-1; r++ {
-		for i := range blocks {
-			blocks[i] = SPNRound(blocks[i], keys[r], S, P)
-		}
+		x ^= keys[r]
+		x = SubBytes(x, S)
+		x = PermuteBits(x, P)
 	}
-
-	for i := range blocks {
-		blocks[i] ^= keys[rounds-1]
-		blocks[i] = SubBytes(blocks[i], S)
-	}
-
-	for i := range blocks {
-		blocks[i] ^= keys[rounds]
-	}
-
-	return blocks
+	x ^= keys[rounds-1]
+	x = SubBytes(x, S)
+	x ^= keys[rounds]
+	return x
 }
 
-func DecryptSPN(blocks []uint16, keys []uint16, rounds int) []uint16 {
-	// Последний раунд
-	for i := range blocks {
-		blocks[i] ^= keys[rounds]
-		blocks[i] = SubBytes(blocks[i], InvS) // обратный S-блок
-		blocks[i] ^= keys[rounds-1]
-	}
+func DecryptBlock(x uint16, keys []uint16) uint16 {
+	x ^= keys[rounds]
+	x = InvSubBytes(x, InvS)
+	x ^= keys[rounds-1]
 
-	// Основные раунды в обратном порядке
 	for r := rounds - 2; r >= 0; r-- {
-		for i := range blocks {
-			blocks[i] = PermuteBytes(blocks[i], InvP) // обратная перестановка
-			blocks[i] = SubBytes(blocks[i], InvS)     // обратный S-блок
-			blocks[i] ^= keys[r]
-		}
+		x = PermuteBits(x, InvP)
+		x = InvSubBytes(x, InvS)
+		x ^= keys[r]
 	}
-
-	return blocks
+	return x
 }
 
-func SPNRound(block uint16, roundKey uint16, sbox [16]uint8, pbox [16]uint8) uint16 {
-	block ^= roundKey
-	block = SubBytes(block, sbox)
-	block = PermuteBytes(block, pbox)
-	return block
-}
-
-func JoinIntoBytes(blocks []uint16) (out []byte) {
-	for _, b := range blocks {
-		out = append(out, byte(b>>8))
-		out = append(out, byte(b))
+func EncryptSPN(arr []uint16, keys []uint16) []uint16 {
+	out := make([]uint16, len(arr))
+	for i := range arr {
+		out[i] = EncryptBlock(arr[i], keys)
 	}
-
 	return out
 }
 
-func PKCS7Pad(data []byte, blockSize int) []byte {
-	padLen := blockSize - len(data)%blockSize
-	if padLen == 0 {
-		padLen = blockSize
+/* -----------------------------------------------------
+   Key schedule
+----------------------------------------------------- */
+
+func GenerateKeys16(rounds int) ([]uint16, error) {
+	var kb [2]byte
+	_, err := rand.Read(kb[:])
+	if err != nil {
+		return nil, err
 	}
-	pad := bytes.Repeat([]byte{byte(padLen)}, padLen)
-	return append(data, pad...)
+	k := uint16(kb[0])<<8 | uint16(kb[1])
+
+	keys := make([]uint16, rounds+1)
+	for i := 0; i <= rounds; i++ {
+		keys[i] = k
+		k = bits.RotateLeft16(k, 4)
+	}
+	return keys, nil
 }
 
-func PKCS7Unpad(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty data")
+/* -----------------------------------------------------
+   Linear cryptanalysis: partial key guess
+----------------------------------------------------- */
+
+// gamma = mask on U4 (input to last S-box layer)
+// guess = 8 bits:
+//   high nibble => nibble 3
+//   low nibble  => nibble 1
+
+func partialDecryptU4(C uint16, guess uint8) uint16 {
+	var k uint16
+	k |= uint16((guess>>4)&0xF) << 12 // nibble 3
+	k |= uint16((guess)&0xF) << 4     // nibble 1
+
+	tmp := C ^ k
+	U4 := InvSubBytes(tmp, InvS)
+	return U4
+}
+
+func AttackRecoverPartialKey(PT, CT []uint16, alpha, gamma uint16) (uint8, []int) {
+	N := len(PT)
+	counts := make([]int, 256)
+
+	for g := 0; g < 256; g++ {
+		c := 0
+		for i := 0; i < N; i++ {
+			left := dotParity16(alpha, PT[i])
+
+			U4 := partialDecryptU4(CT[i], uint8(g))
+			right := dotParity16(gamma, U4)
+
+			if left^right == 0 {
+				c++
+			}
+		}
+		counts[g] = c
 	}
-	padLen := int(data[len(data)-1])
-	if padLen == 0 || padLen > len(data) {
-		return nil, fmt.Errorf("invalid padding")
-	}
-	for _, b := range data[len(data)-padLen:] {
-		if int(b) != padLen {
-			return nil, fmt.Errorf("invalid padding")
+
+	bestG := 0
+	bestDev := 0.0
+	half := float64(N) * 0.5
+
+	for g := 0; g < 256; g++ {
+		dev := math.Abs(float64(counts[g]) - half)
+		if dev > bestDev {
+			bestDev = dev
+			bestG = g
 		}
 	}
-	return data[:len(data)-padLen], nil
+
+	return uint8(bestG), counts
 }
 
+/* -----------------------------------------------------
+   Full key recovery from partial candidates
+----------------------------------------------------- */
+
+func RecoverFullKey(PT, CT []uint16, partial []int) []uint16 {
+	N := len(PT)
+	var found []uint16
+	checkPairs := 30 // проверяем только первые 30 пар
+
+	if N < checkPairs {
+		checkPairs = N
+	}
+
+	for _, p := range partial {
+		n3 := uint16((p >> 4) & 0xF)
+		n1 := uint16(p & 0xF)
+
+		for n2 := 0; n2 < 16; n2++ {
+			for n0 := 0; n0 < 16; n0++ {
+				k := uint16(n3)<<12 | uint16(n2)<<8 | uint16(n1)<<4 | uint16(n0)
+
+				keys := make([]uint16, rounds+1)
+				cur := k
+				for i := range keys {
+					keys[i] = cur
+					cur = bits.RotateLeft16(cur, 4)
+				}
+
+				ok := true
+				for i := 0; i < checkPairs; i++ {
+					if DecryptBlock(CT[i], keys) != PT[i] {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					found = append(found, k)
+				}
+			}
+		}
+	}
+
+	return found
+}
+
+/* -----------------------------------------------------
+   Helper: top K
+----------------------------------------------------- */
+
+type pair struct {
+	g, c int
+}
+
+func topK(counts []int, K int) []pair {
+	arr := make([]pair, 256)
+	for g := 0; g < 256; g++ {
+		arr[g] = pair{g, counts[g]}
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		return arr[i].c > arr[j].c
+	})
+	if K > len(arr) {
+		K = len(arr)
+	}
+	return arr[:K]
+}
+
+// Convert text string into []uint16 blocks
+func TextToBlocks(text string) []uint16 {
+	b := []byte(text)
+	if len(b)%2 != 0 {
+		b = append(b, 0) // дополняем нулём, если нечётное число символов
+	}
+	blocks := make([]uint16, len(b)/2)
+	for i := 0; i < len(b)/2; i++ {
+		blocks[i] = uint16(b[2*i])<<8 | uint16(b[2*i+1])
+	}
+	return blocks
+}
+
+// Convert []uint16 blocks back into string
+func BlocksToText(blocks []uint16) string {
+	b := make([]byte, len(blocks)*2)
+	for i, bl := range blocks {
+		b[2*i] = byte(bl >> 8)
+		b[2*i+1] = byte(bl & 0xFF)
+	}
+	// удаляем нули в конце (если были добавлены для выравнивания)
+	return string(b)
+}
+
+/* -----------------------------------------------------
+   MAIN
+----------------------------------------------------- */
+
 func main() {
-	// for i, v := range S {
-	// 	InvS[v] = uint8(i)
-	// }
-	// for i, v := range P {
-	// 	InvP[v] = uint8(i)
-	// }
-	// plainText := "secret"
-	// fmt.Printf("Полученные блоки байт: %v\n", []byte(plainText))
-	// blocks := SplitIntoBlocks16(plainText)
+	prepareInverses()
+	printLAT()
 
-	// keys, err := GenerateKeys16(rounds)
-	// if err != nil {
-	// 	fmt.Printf("Ошибка генервции ключа: %v\n", err)
-	// 	return
-	// }
+	keys := generateKeysOrPanic(rounds)
+	fmt.Printf("\nREAL last key = 0x%04X\n", keys[rounds])
 
-	// copyBlocks := make([]uint16, len(blocks))
-	// copy(copyBlocks, blocks)
-	// encryptedBlocks := EncryptSPN(copyBlocks, keys, rounds)
+	N := 10000
+	PT := generateRandomPlaintexts(N)
+	CT := EncryptSPN(PT, keys)
 
-	// copyEncryptedBlocks := make([]uint16, len(encryptedBlocks))
-	// copy(copyEncryptedBlocks, encryptedBlocks)
-	// decryptedBlocks := DecryptSPN(copyEncryptedBlocks, keys, rounds)
+	alpha := uint16(0x1010)
+	gamma := uint16(0x2020)
 
-	// decryptedBytes := JoinIntoBytes(decryptedBlocks)
-	// decryptedBytesUnpad, err := PKCS7Unpad(decryptedBytes)
-	// if err != nil {
-	// 	fmt.Printf("Ошибка Unpad: %v", err)
-	// }
-	// fmt.Println(string(decryptedBytesUnpad))
-	lat := makeLAT(desS)
+	guess, counts := AttackRecoverPartialKey(PT, CT, alpha, gamma)
+	fmt.Printf("Best guess = 0x%02X\n", guess)
+	printTrueNibble(keys)
+
+	top := topK(counts, 10)
+	printTopCandidates(top)
+
+	pars := extractTopGuesses(top)
+	found := RecoverFullKey(PT, CT, pars)
+	fmt.Println("\nRecovered full keys:", found)
+
+	if len(found) > 0 {
+		demoDecryption(found[0], keys, "Secret text")
+	}
+}
+
+
+func prepareInverses() {
+	for i := 0; i < 16; i++ {
+		InvS[S[i]] = uint8(i)
+		InvP[P[i]] = uint8(i)
+	}
+}
+
+func printLAT() {
+	lat := makeLAT(S)
+	fmt.Println("LAT:")
 	for i := 0; i < 16; i++ {
 		for j := 0; j < 16; j++ {
 			fmt.Printf("%4d", lat[i][j])
@@ -227,3 +340,67 @@ func main() {
 		fmt.Println()
 	}
 }
+
+func generateKeysOrPanic(rounds int) []uint16 {
+	keys, err := GenerateKeys16(rounds)
+	if err != nil {
+		panic(err)
+	}
+	return keys
+}
+
+func generateRandomPlaintexts(N int) []uint16 {
+	PT := make([]uint16, N)
+	for i := 0; i < N; i++ {
+		var b [2]byte
+		rand.Read(b[:])
+		PT[i] = uint16(b[0])<<8 | uint16(b[1])
+	}
+	return PT
+}
+
+func printTrueNibble(keys []uint16) {
+	trueNib3 := (keys[rounds] >> 12) & 0xF
+	trueNib1 := (keys[rounds] >> 4) & 0xF
+	fmt.Printf("True value = 0x%02X\n", trueNib3<<4|trueNib1)
+}
+
+func printTopCandidates(top []pair) {
+	fmt.Println("Top candidates:")
+	for _, t := range top {
+		fmt.Printf("0x%02X : %d\n", t.g, t.c)
+	}
+}
+
+func extractTopGuesses(top []pair) []int {
+	pars := make([]int, 0, len(top))
+	for _, t := range top {
+		pars = append(pars, t.g)
+	}
+	return pars
+}
+
+func demoDecryption(foundKey uint16, realKeys []uint16, text string) {
+	fmt.Println("\n--- Demo decryption with text ---")
+
+	testPT := TextToBlocks(text)
+	testCT := EncryptSPN(testPT, realKeys)
+
+	keysRecovered := make([]uint16, rounds+1)
+	cur := foundKey
+	for i := range keysRecovered {
+		keysRecovered[i] = cur
+		cur = bits.RotateLeft16(cur, 4)
+	}
+
+	decrypted := make([]uint16, len(testCT))
+	for i := range testCT {
+		decrypted[i] = DecryptBlock(testCT[i], keysRecovered)
+	}
+
+	decryptedText := BlocksToText(decrypted)
+	fmt.Printf("Test PT = %q\n", text)
+	fmt.Printf("Encrypted blocks = %v\n", testCT)
+	fmt.Printf("Decrypted text = %q\n", decryptedText)
+}
+
